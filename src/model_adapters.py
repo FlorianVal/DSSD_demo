@@ -127,6 +127,11 @@ class LlamaStyleAdapter(ModelAdapter):
     ) -> Optional[Tuple[Tensor, Tensor]]:
         if self._rotary is not None:
             cos, sin = self._rotary(hidden_states, position_ids)
+            # Unsqueeze to (batch, 1, seq_len, head_dim) to support broadcasting
+            # This matches LlamaModel behavior which prepares embeddings for layers
+            if cos.dim() == 3:
+                cos = cos.unsqueeze(1)
+                sin = sin.unsqueeze(1)
             return (cos, sin)
         return None
 
