@@ -179,7 +179,7 @@ def generate(
 ):
     """Main generation function for Gradio interface with streaming."""
     try:
-        decoder = get_decoder(model_key, use_local=True)
+        decoder = get_decoder(model_key)
     except Exception as e:
         error_msg = f"<p style='color: red;'>Error loading model: {e}</p>"
         yield (error_msg, "", "", error_msg)
