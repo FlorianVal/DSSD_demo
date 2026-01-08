@@ -36,6 +36,7 @@ class ModelAdapter(ABC):
         past_key_value: Optional[Tuple],
         position_embeddings: Optional[Tuple],
         use_cache: bool = True,
+        cache_position: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tuple]]:
         """Forward through a single layer, returning hidden states and optional KV cache."""
         ...
@@ -99,6 +100,7 @@ class LlamaStyleAdapter(ModelAdapter):
         past_key_value: Optional[Tuple],
         position_embeddings: Optional[Tuple],
         use_cache: bool = True,
+        cache_position: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tuple]]:
         """Forward through a decoder layer."""
         layer_outputs = layer(
@@ -108,6 +110,7 @@ class LlamaStyleAdapter(ModelAdapter):
             past_key_value=past_key_value,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
+            cache_position=cache_position,
         )
         hidden_states = layer_outputs[0]
         new_kv = layer_outputs[1] if len(layer_outputs) > 1 else None

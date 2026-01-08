@@ -522,6 +522,9 @@ class DSSDecoder:
             0
         )
 
+        # Cache position (required by newer transformers for Qwen3)
+        cache_position = torch.arange(seq_len, dtype=torch.long, device=device)
+
         # Get embeddings
         hidden_states = self.adapter.get_embed_tokens(input_ids)
 
@@ -544,6 +547,7 @@ class DSSDecoder:
                     past_key_value=None,
                     position_embeddings=position_embeddings,
                     use_cache=False,
+                    cache_position=cache_position,
                 )
 
                 # Check if this is a head checkpoint
