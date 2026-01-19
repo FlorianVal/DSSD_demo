@@ -218,28 +218,29 @@ class DSSDecoder:
         validated_tokens = []
         current_ids = input_ids.clone()
         num_layers = self.adapter.get_num_layers()
-        head_layers = self.model_config.head_layer_indices
 
         while len(validated_tokens) < max_tokens:
             # ============================================================
-            # DRAFT PHASE: Generate tokens using early exit heads
+            # DRAFT PHASE: Generate tokens using early exit or lm_head
             # ============================================================
             drafted_tokens = []
             draft_ids = current_ids.clone()
+            got_lm_head_token = False
 
             for _ in range(max_draft_length):
                 if len(validated_tokens) + len(drafted_tokens) >= max_tokens:
                     break
 
-                draft_result = self._draft_single_token(draft_ids, thresholds)
-
-                if draft_result is None:
-                    break
-
-                token_id, exit_head, exit_layer, uncertainty = draft_result
+                # Generate a token (always returns a result)
+                token_id, exit_head, exit_layer, uncertainty = self._draft_single_token(
+                    draft_ids, thresholds
+                )
 
                 if token_id == self.tokenizer.eos_token_id:
-                    break
+                    # EOS handling
+                    if exit_head is not None and drafted_tokens:
+                        break  # Verify pending drafts first
+                    return  # Stop generation
 
                 token_text = self.tokenizer.decode([token_id])
                 drafted_token = TokenInfo(
@@ -254,46 +255,117 @@ class DSSDecoder:
                     [draft_ids, torch.tensor([[token_id]], device=self.device)], dim=1
                 )
 
-                # Yield draft event
-                yield StreamEvent(
-                    event_type="draft",
-                    tokens=list(validated_tokens),
-                    drafted_tokens=list(drafted_tokens),
-                    message=f"Drafting token {len(drafted_tokens)} using Head {exit_head}",
-                )
+                if exit_head is None:
+                    # Token from lm_head - triggers verification
+                    got_lm_head_token = True
+                    yield StreamEvent(
+                        event_type="draft",
+                        tokens=list(validated_tokens),
+                        drafted_tokens=list(drafted_tokens),
+                        message=f"Drafting token {len(drafted_tokens)} using Full Model",
+                    )
+                    break
+                else:
+                    # Token from early exit head
+                    yield StreamEvent(
+                        event_type="draft",
+                        tokens=list(validated_tokens),
+                        drafted_tokens=list(drafted_tokens),
+                        message=f"Drafting token {len(drafted_tokens)} using Head {exit_head}",
+                    )
 
             # ============================================================
             # VERIFY PHASE
             # ============================================================
-            if drafted_tokens:
-                yield StreamEvent(
-                    event_type="verify_start",
-                    tokens=list(validated_tokens),
-                    drafted_tokens=list(drafted_tokens),
-                    message=f"Verifying {len(drafted_tokens)} drafted tokens...",
-                )
+            if not drafted_tokens:
+                break
 
-                with torch.no_grad():
-                    outputs = self.model(draft_ids, use_cache=False)
-                    verify_logits = outputs.logits
+            yield StreamEvent(
+                event_type="verify_start",
+                tokens=list(validated_tokens),
+                drafted_tokens=list(drafted_tokens),
+                message=f"Verifying {len(drafted_tokens)} drafted tokens...",
+            )
 
-                start_pos = current_ids.shape[1] - 1
+            with torch.no_grad():
+                outputs = self.model(draft_ids, use_cache=False)
+                verify_logits = outputs.logits
 
-                for i, drafted_token in enumerate(drafted_tokens):
-                    verify_pos = start_pos + i
-                    verified_token_id = torch.argmax(
-                        verify_logits[0, verify_pos, :]
+            start_pos = current_ids.shape[1] - 1
+            all_accepted = True
+
+            for i, drafted_token in enumerate(drafted_tokens):
+                verify_pos = start_pos + i
+                verified_token_id = torch.argmax(
+                    verify_logits[0, verify_pos, :]
+                ).item()
+
+                if drafted_token.token_id == verified_token_id:
+                    # Accept
+                    validated_tokens.append(drafted_token)
+                    current_ids = torch.cat(
+                        [
+                            current_ids,
+                            torch.tensor(
+                                [[drafted_token.token_id]], device=self.device
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    yield StreamEvent(
+                        event_type="accept",
+                        tokens=list(validated_tokens),
+                        drafted_tokens=[],
+                        message=f"✓ Accepted '{drafted_token.token_text}'",
+                    )
+                else:
+                    # Reject - use full model's token
+                    all_accepted = False
+                    token_text = self.tokenizer.decode([verified_token_id])
+                    corrected_token = TokenInfo(
+                        token_id=verified_token_id,
+                        token_text=token_text,
+                        exit_head=None,
+                        exit_layer=num_layers,
+                        uncertainty=0.0,
+                    )
+                    validated_tokens.append(corrected_token)
+                    current_ids = torch.cat(
+                        [
+                            current_ids,
+                            torch.tensor([[verified_token_id]], device=self.device),
+                        ],
+                        dim=1,
+                    )
+                    yield StreamEvent(
+                        event_type="reject",
+                        tokens=list(validated_tokens),
+                        drafted_tokens=[],
+                        message=f"✗ Rejected '{drafted_token.token_text}' → '{token_text}'",
+                    )
+                    break
+
+            # BONUS TOKEN: If all tokens were accepted, get bonus from last position
+            if all_accepted and len(validated_tokens) < max_tokens:
+                bonus_pos = start_pos + len(drafted_tokens)
+                if bonus_pos < verify_logits.shape[1]:
+                    bonus_token_id = torch.argmax(
+                        verify_logits[0, bonus_pos, :]
                     ).item()
-
-                    if drafted_token.token_id == verified_token_id:
-                        # Accept
-                        validated_tokens.append(drafted_token)
+                    if bonus_token_id != self.tokenizer.eos_token_id:
+                        bonus_text = self.tokenizer.decode([bonus_token_id])
+                        bonus_token = TokenInfo(
+                            token_id=bonus_token_id,
+                            token_text=bonus_text,
+                            exit_head=None,
+                            exit_layer=num_layers,
+                            uncertainty=0.0,
+                        )
+                        validated_tokens.append(bonus_token)
                         current_ids = torch.cat(
                             [
                                 current_ids,
-                                torch.tensor(
-                                    [[drafted_token.token_id]], device=self.device
-                                ),
+                                torch.tensor([[bonus_token_id]], device=self.device),
                             ],
                             dim=1,
                         )
@@ -301,62 +373,8 @@ class DSSDecoder:
                             event_type="accept",
                             tokens=list(validated_tokens),
                             drafted_tokens=[],
-                            message=f"✓ Accepted '{drafted_token.token_text}'",
+                            message=f"✓ Bonus token '{bonus_text}'",
                         )
-                    else:
-                        # Reject - use full model's token
-                        token_text = self.tokenizer.decode([verified_token_id])
-                        corrected_token = TokenInfo(
-                            token_id=verified_token_id,
-                            token_text=token_text,
-                            exit_head=None,
-                            exit_layer=num_layers,
-                            uncertainty=0.0,
-                        )
-                        validated_tokens.append(corrected_token)
-                        current_ids = torch.cat(
-                            [
-                                current_ids,
-                                torch.tensor([[verified_token_id]], device=self.device),
-                            ],
-                            dim=1,
-                        )
-                        yield StreamEvent(
-                            event_type="reject",
-                            tokens=list(validated_tokens),
-                            drafted_tokens=[],
-                            message=f"✗ Rejected '{drafted_token.token_text}' → '{token_text}'",
-                        )
-                        break
-            else:
-                # No drafts - generate with full model
-                with torch.no_grad():
-                    outputs = self.model(current_ids, use_cache=False)
-                    logits = outputs.logits
-
-                token_id = torch.argmax(logits[0, -1, :]).item()
-
-                if token_id == self.tokenizer.eos_token_id:
-                    break
-
-                token_text = self.tokenizer.decode([token_id])
-                full_token = TokenInfo(
-                    token_id=token_id,
-                    token_text=token_text,
-                    exit_head=None,
-                    exit_layer=num_layers,
-                    uncertainty=0.0,
-                )
-                validated_tokens.append(full_token)
-                current_ids = torch.cat(
-                    [current_ids, torch.tensor([[token_id]], device=self.device)], dim=1
-                )
-                yield StreamEvent(
-                    event_type="full_model",
-                    tokens=list(validated_tokens),
-                    drafted_tokens=[],
-                    message=f"Full model: '{token_text}'",
-                )
 
             if (
                 validated_tokens
@@ -374,55 +392,170 @@ class DSSDecoder:
         """
         Speculative decoding with early exit heads.
 
-        GUARANTEES same output as full model by:
-        1. DRAFT: Generate tokens using early exit heads (fast, partial compute)
-        2. VERIFY: When full model needed, verify ALL drafted tokens
-        3. ACCEPT: Keep matching tokens, take model's token at first mismatch
+        The flow:
+        1. Generate tokens using _draft_single_token (which may early exit or use lm_head)
+        2. Tokens from early exit heads are "drafts" that need verification
+        3. When we get a token from lm_head (exit_head=None), it triggers verification
+           of all pending drafts, and the lm_head token is accepted as verified
+        4. All accepted tokens are guaranteed to match full model output
         """
         tokens = []
         current_ids = input_ids.clone()
         num_layers = self.adapter.get_num_layers()
-        head_layers = self.model_config.head_layer_indices
 
         while len(tokens) < max_tokens:
             # ============================================================
-            # DRAFT PHASE: Generate tokens using early exit heads
+            # DRAFT PHASE: Generate tokens, collecting early exit drafts
             # ============================================================
             drafted_tokens = []  # List of (token_id, exit_head, exit_layer, uncertainty)
             draft_ids = current_ids.clone()
+            got_lm_head_token = False
 
             for _ in range(max_draft_length):
                 if len(tokens) + len(drafted_tokens) >= max_tokens:
                     break
 
-                # Try to draft a token using early exit
-                draft_result = self._draft_single_token(draft_ids, thresholds)
-
-                if draft_result is None:
-                    # No head was confident enough - need to verify
-                    break
-
-                token_id, exit_head, exit_layer, uncertainty = draft_result
-
-                if token_id == self.tokenizer.eos_token_id:
-                    break
-
-                drafted_tokens.append((token_id, exit_head, exit_layer, uncertainty))
-                draft_ids = torch.cat(
-                    [draft_ids, torch.tensor([[token_id]], device=self.device)], dim=1
+                # Generate a token (always returns a result, never None)
+                token_id, exit_head, exit_layer, uncertainty = self._draft_single_token(
+                    draft_ids, thresholds
                 )
 
+                if token_id == self.tokenizer.eos_token_id:
+                    # If EOS from early exit, we still need to verify pending drafts
+                    if exit_head is not None and drafted_tokens:
+                        # Don't add EOS to drafts, just break to verify
+                        break
+                    # If EOS from lm_head or no pending drafts, we're done
+                    return tokens
+
+                if exit_head is None:
+                    # Token from lm_head - this is verified, triggers verification of drafts
+                    got_lm_head_token = True
+                    # Add to drafts for unified handling, but mark as already verified
+                    drafted_tokens.append((token_id, exit_head, exit_layer, uncertainty))
+                    draft_ids = torch.cat(
+                        [draft_ids, torch.tensor([[token_id]], device=self.device)], dim=1
+                    )
+                    break  # Stop drafting, go to verification
+                else:
+                    # Token from early exit head - add to drafts for later verification
+                    drafted_tokens.append((token_id, exit_head, exit_layer, uncertainty))
+                    draft_ids = torch.cat(
+                        [draft_ids, torch.tensor([[token_id]], device=self.device)], dim=1
+                    )
+
             # ============================================================
-            # VERIFY PHASE: Run full model to verify drafted tokens
+            # VERIFY PHASE: Verify drafted tokens with full model
             # ============================================================
-            if drafted_tokens:
-                # Run full model on current_ids + all drafted tokens
+            if not drafted_tokens:
+                # No tokens generated (shouldn't happen with the new logic)
+                break
+
+            # If the last token is from lm_head, we already have full model output
+            # for all positions. Use it for verification.
+            last_token = drafted_tokens[-1]
+            _, last_exit_head, _, _ = last_token
+
+            if last_exit_head is None:
+                # Last token is from lm_head - all earlier tokens need verification
+                # The lm_head pass already computed logits for all positions
+                # We can use the model output to verify
+                
+                # Need to run full model to get logits for verification
                 with torch.no_grad():
                     outputs = self.model(draft_ids, use_cache=False)
                     verify_logits = outputs.logits
 
-                # Verify each drafted token
-                start_pos = current_ids.shape[1] - 1  # Position before drafting
+                start_pos = current_ids.shape[1] - 1
+
+                for i, (drafted_token, exit_head, exit_layer, uncertainty) in enumerate(
+                    drafted_tokens
+                ):
+                    verify_pos = start_pos + i
+                    verified_token = torch.argmax(
+                        verify_logits[0, verify_pos, :]
+                    ).item()
+
+                    if drafted_token == verified_token:
+                        # Token matches - accept it
+                        token_text = self.tokenizer.decode([drafted_token])
+                        tokens.append(
+                            TokenInfo(
+                                token_id=drafted_token,
+                                token_text=token_text,
+                                exit_head=exit_head,
+                                exit_layer=exit_layer,
+                                uncertainty=uncertainty,
+                            )
+                        )
+                        current_ids = torch.cat(
+                            [
+                                current_ids,
+                                torch.tensor([[drafted_token]], device=self.device),
+                            ],
+                            dim=1,
+                        )
+                    else:
+                        # Mismatch - use full model's token
+                        token_text = self.tokenizer.decode([verified_token])
+                        tokens.append(
+                            TokenInfo(
+                                token_id=verified_token,
+                                token_text=token_text,
+                                exit_head=None,  # Full model
+                                exit_layer=num_layers,
+                                uncertainty=0.0,
+                            )
+                        )
+                        current_ids = torch.cat(
+                            [
+                                current_ids,
+                                torch.tensor([[verified_token]], device=self.device),
+                            ],
+                            dim=1,
+                        )
+                        # Stop - discard remaining drafted tokens
+                        break
+
+                # BONUS TOKEN: If all drafted tokens were accepted, use the last position
+                # to get an additional token (this is the "free" token from lm_head)
+                if len(tokens) >= len(drafted_tokens):
+                    # All drafts were accepted, check for bonus token
+                    bonus_pos = start_pos + len(drafted_tokens)
+                    if bonus_pos < verify_logits.shape[1]:
+                        bonus_token_id = torch.argmax(
+                            verify_logits[0, bonus_pos, :]
+                        ).item()
+                        if (
+                            bonus_token_id != self.tokenizer.eos_token_id
+                            and len(tokens) < max_tokens
+                        ):
+                            bonus_text = self.tokenizer.decode([bonus_token_id])
+                            tokens.append(
+                                TokenInfo(
+                                    token_id=bonus_token_id,
+                                    token_text=bonus_text,
+                                    exit_head=None,  # Full model
+                                    exit_layer=num_layers,
+                                    uncertainty=0.0,
+                                )
+                            )
+                            current_ids = torch.cat(
+                                [
+                                    current_ids,
+                                    torch.tensor(
+                                        [[bonus_token_id]], device=self.device
+                                    ),
+                                ],
+                                dim=1,
+                            )
+            else:
+                # All tokens are from early exit heads - need to run full model for verification
+                with torch.no_grad():
+                    outputs = self.model(draft_ids, use_cache=False)
+                    verify_logits = outputs.logits
+
+                start_pos = current_ids.shape[1] - 1
 
                 for i, (drafted_token, exit_head, exit_layer, uncertainty) in enumerate(
                     drafted_tokens
@@ -472,30 +605,37 @@ class DSSDecoder:
                         )
                         # Stop - discard remaining drafted tokens
                         break
-            else:
-                # No tokens drafted - generate one with full model
-                with torch.no_grad():
-                    outputs = self.model(current_ids, use_cache=False)
-                    logits = outputs.logits
 
-                token_id = torch.argmax(logits[0, -1, :]).item()
-
-                if token_id == self.tokenizer.eos_token_id:
-                    break
-
-                token_text = self.tokenizer.decode([token_id])
-                tokens.append(
-                    TokenInfo(
-                        token_id=token_id,
-                        token_text=token_text,
-                        exit_head=None,
-                        exit_layer=num_layers,
-                        uncertainty=0.0,
-                    )
-                )
-                current_ids = torch.cat(
-                    [current_ids, torch.tensor([[token_id]], device=self.device)], dim=1
-                )
+                # BONUS TOKEN from verification pass
+                if len(tokens) >= len(drafted_tokens):
+                    bonus_pos = start_pos + len(drafted_tokens)
+                    if bonus_pos < verify_logits.shape[1]:
+                        bonus_token_id = torch.argmax(
+                            verify_logits[0, bonus_pos, :]
+                        ).item()
+                        if (
+                            bonus_token_id != self.tokenizer.eos_token_id
+                            and len(tokens) < max_tokens
+                        ):
+                            bonus_text = self.tokenizer.decode([bonus_token_id])
+                            tokens.append(
+                                TokenInfo(
+                                    token_id=bonus_token_id,
+                                    token_text=bonus_text,
+                                    exit_head=None,  # Full model
+                                    exit_layer=num_layers,
+                                    uncertainty=0.0,
+                                )
+                            )
+                            current_ids = torch.cat(
+                                [
+                                    current_ids,
+                                    torch.tensor(
+                                        [[bonus_token_id]], device=self.device
+                                    ),
+                                ],
+                                dim=1,
+                            )
 
             # Check for EOS in accepted tokens
             if tokens and tokens[-1].token_id == self.tokenizer.eos_token_id:
@@ -507,15 +647,20 @@ class DSSDecoder:
         self,
         input_ids: torch.Tensor,
         thresholds: Dict[int, float],
-    ) -> Optional[Tuple[int, int, int, float]]:
+    ) -> Tuple[int, Optional[int], int, float]:
         """
-        Try to draft a single token using early exit heads.
-        Returns (token_id, exit_head, exit_layer, uncertainty) if confident enough.
-        Returns None if no head is confident enough (need full model verification).
+        Generate a single token using early exit or full model.
+        
+        Returns (token_id, exit_head, exit_layer, uncertainty):
+        - If an early exit head is confident: returns token with that head's info
+        - If no head is confident: continues to lm_head and returns token from there
+        
+        This function ALWAYS returns a token (never returns None).
         """
         device = input_ids.device
         seq_len = input_ids.shape[1]
         head_layers = self.model_config.head_layer_indices
+        num_layers = self.adapter.get_num_layers()
 
         # Position IDs
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(
@@ -570,8 +715,18 @@ class DSSDecoder:
                             token_id = torch.argmax(head_logits[0, -1, :]).item()
                             return (token_id, head_idx, layer_idx, uncertainty)
 
-        # No head was confident enough - need full model verification
-        return None
+            # No head was confident - use lm_head to get the token
+            # Apply final norm and lm_head
+            final_hidden = self.adapter.apply_final_norm(hidden_states)
+            logits = self.adapter.get_lm_head_output(final_hidden)
+            
+            # Get token from last position
+            token_id = torch.argmax(logits[0, -1, :]).item()
+            
+            # Compute uncertainty for the lm_head output
+            uncertainty = self.uncertainty_fn(logits[0, -1, :].unsqueeze(0), dim=-1).item()
+            
+            return (token_id, None, num_layers, uncertainty)
 
     def _generate_full_model(
         self,
