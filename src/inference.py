@@ -54,13 +54,46 @@ class TokenInfo:
 
 
 @dataclass
+class StreamingResult:
+    """Result from streaming generation with accumulated metrics."""
+
+    tokens: List[TokenInfo]
+    total_time: float
+    tokens_per_second: float
+    avg_exit_layer: float
+    exit_distribution: Dict[str, int]
+
+    @classmethod
+    def from_tokens(cls, tokens: List[TokenInfo], total_time: float, num_layers: int) -> "StreamingResult":
+        """Build a StreamingResult from a list of tokens and timing info."""
+        exit_dist: Dict[str, int] = {}
+        layer_sum = 0
+
+        for t in tokens:
+            key = str(t.exit_head) if t.exit_head is not None else "full"
+            exit_dist[key] = exit_dist.get(key, 0) + 1
+            layer_sum += t.exit_layer
+
+        avg_layer = layer_sum / len(tokens) if tokens else num_layers
+
+        return cls(
+            tokens=tokens,
+            total_time=total_time,
+            tokens_per_second=len(tokens) / total_time if total_time > 0 else 0,
+            avg_exit_layer=avg_layer,
+            exit_distribution=exit_dist,
+        )
+
+
+@dataclass
 class StreamEvent:
     """Event for streaming generation updates."""
 
-    event_type: str  # "draft", "verify_start", "accept", "reject", "full_model"
+    event_type: str  # "draft", "verify_start", "accept", "reject", "full_model", "complete"
     tokens: List[TokenInfo]  # All tokens so far (validated)
     drafted_tokens: List[TokenInfo]  # Currently drafted (pending verification)
     message: str  # Human-readable status
+    result: Optional[StreamingResult] = None  # Set on final "complete" event
 
 
 @dataclass
@@ -100,6 +133,25 @@ class DSSDecoder:
         self.device = device
         self.uncertainty_fn = compute_entropy
 
+    def _format_and_encode_prompt(self, prompt: str, use_chat_template: bool) -> torch.Tensor:
+        """Format prompt with optional chat template and return input_ids tensor."""
+        if (
+            use_chat_template
+            and hasattr(self.tokenizer, "chat_template")
+            and self.tokenizer.chat_template is not None
+        ):
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                formatted = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
+                )
+                return self.tokenizer.encode(formatted, return_tensors="pt").to(
+                    self.device
+                )
+            except Exception:
+                pass  # Fall through to raw prompt encoding
+        return self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+
     def generate(
         self,
         prompt: str,
@@ -112,29 +164,7 @@ class DSSDecoder:
         Generate text with optional early exit.
         Returns detailed token-level information for visualization.
         """
-        # Format prompt - check if tokenizer has a chat template set
-        if (
-            use_chat_template
-            and hasattr(self.tokenizer, "chat_template")
-            and self.tokenizer.chat_template is not None
-        ):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=False
-                )
-                input_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(
-                    self.device
-                )
-            except Exception:
-                # Fallback to raw prompt if chat template fails
-                input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                    self.device
-                )
-        else:
-            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                self.device
-            )
+        input_ids = self._format_and_encode_prompt(prompt, use_chat_template)
 
         # Get thresholds
         thresholds = {}
@@ -186,29 +216,9 @@ class DSSDecoder:
         """
         Generate with streaming - yields events showing draft/verify process.
         Each event shows current validated tokens and pending drafted tokens.
+        Yields a final "complete" event with StreamingResult containing metrics.
         """
-        # Format prompt
-        if (
-            use_chat_template
-            and hasattr(self.tokenizer, "chat_template")
-            and self.tokenizer.chat_template is not None
-        ):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=False
-                )
-                input_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(
-                    self.device
-                )
-            except Exception:
-                input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                    self.device
-                )
-        else:
-            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                self.device
-            )
+        input_ids = self._format_and_encode_prompt(prompt, use_chat_template)
 
         # Get thresholds
         thresholds = {}
@@ -218,6 +228,7 @@ class DSSDecoder:
         validated_tokens = []
         current_ids = input_ids.clone()
         num_layers = self.adapter.get_num_layers()
+        start_time = time.time()
 
         while len(validated_tokens) < max_tokens:
             # ============================================================
@@ -226,6 +237,7 @@ class DSSDecoder:
             drafted_tokens = []
             draft_ids = current_ids.clone()
             got_lm_head_token = False
+            should_stop = False
 
             for _ in range(max_draft_length):
                 if len(validated_tokens) + len(drafted_tokens) >= max_tokens:
@@ -240,7 +252,8 @@ class DSSDecoder:
                     # EOS handling
                     if exit_head is not None and drafted_tokens:
                         break  # Verify pending drafts first
-                    return  # Stop generation
+                    should_stop = True
+                    break  # Stop generation
 
                 token_text = self.tokenizer.decode([token_id])
                 drafted_token = TokenInfo(
@@ -273,6 +286,10 @@ class DSSDecoder:
                         drafted_tokens=list(drafted_tokens),
                         message=f"Drafting token {len(drafted_tokens)} using Head {exit_head}",
                     )
+
+            # Check if we should stop (EOS encountered with no pending drafts)
+            if should_stop:
+                break
 
             # ============================================================
             # VERIFY PHASE
@@ -381,6 +398,17 @@ class DSSDecoder:
                 and validated_tokens[-1].token_id == self.tokenizer.eos_token_id
             ):
                 break
+
+        # Yield final "complete" event with metrics
+        total_time = time.time() - start_time
+        result = StreamingResult.from_tokens(validated_tokens, total_time, num_layers)
+        yield StreamEvent(
+            event_type="complete",
+            tokens=list(validated_tokens),
+            drafted_tokens=[],
+            message="Generation complete",
+            result=result,
+        )
 
     def _generate_with_early_exit(
         self,
@@ -773,33 +801,14 @@ class DSSDecoder:
     ):
         """
         Generate with full model in streaming mode - yields each token as generated.
+        Yields a final "complete" event with StreamingResult containing metrics.
         """
-        # Format prompt
-        if (
-            use_chat_template
-            and hasattr(self.tokenizer, "chat_template")
-            and self.tokenizer.chat_template is not None
-        ):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=False
-                )
-                input_ids = self.tokenizer.encode(formatted, return_tensors="pt").to(
-                    self.device
-                )
-            except Exception:
-                input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                    self.device
-                )
-        else:
-            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(
-                self.device
-            )
+        input_ids = self._format_and_encode_prompt(prompt, use_chat_template)
 
         tokens = []
         current_ids = input_ids.clone()
         num_layers = self.adapter.get_num_layers()
+        start_time = time.time()
 
         for i in range(max_tokens):
             with torch.no_grad():
@@ -831,6 +840,17 @@ class DSSDecoder:
                 drafted_tokens=[],
                 message=f"Token {i + 1}: '{token_text}'",
             )
+
+        # Yield final "complete" event with metrics
+        total_time = time.time() - start_time
+        result = StreamingResult.from_tokens(tokens, total_time, num_layers)
+        yield StreamEvent(
+            event_type="complete",
+            tokens=list(tokens),
+            drafted_tokens=[],
+            message="Generation complete",
+            result=result,
+        )
 
 
 def load_dssd_model(

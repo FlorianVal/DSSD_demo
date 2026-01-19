@@ -2,7 +2,7 @@
 # Re-exported from the main package for demo use
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
@@ -34,10 +34,6 @@ class ModelConfig:
             training_config=data.get("training_config"),
         )
 
-    def to_json(self, path: str) -> None:
-        with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
-
 
 @dataclass
 class CalibrationResult:
@@ -56,15 +52,6 @@ class CalibrationResult:
         with open(path, "r") as f:
             data = json.load(f)
         return cls(**data)
-
-    def to_json(self, path: str) -> None:
-        with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
-
-    def get_threshold(self, accuracy_level: float, head_idx: int) -> float:
-        level_key = f"{accuracy_level:.2f}"
-        head_key = str(head_idx)
-        return self.thresholds[level_key][head_key]
 
     def get_thresholds_for_level(self, accuracy_level: float) -> Dict[int, float]:
         """Get all thresholds for a given accuracy level."""

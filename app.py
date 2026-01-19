@@ -4,10 +4,12 @@ Showcases early exit inference with color-coded tokens showing which head genera
 """
 
 import gradio as gr
+from dataclasses import dataclass
 from pathlib import Path
+import time
 from huggingface_hub import hf_hub_download
 
-from src.inference import load_dssd_model, DSSDecoder, TokenInfo, StreamEvent
+from src.inference import load_dssd_model, DSSDecoder, TokenInfo, StreamEvent, StreamingResult
 
 # Available models configuration
 AVAILABLE_MODELS = {
@@ -32,6 +34,10 @@ HEAD_COLORS = [
     "#8338EC",  # Purple - Head 4
 ]
 FULL_MODEL_COLOR = "#95D5B2"  # Light green - Full model
+
+PENDING_TOKEN_BORDER = "var(--border-color-primary)"
+PENDING_TOKEN_TEXT = "var(--body-text-color)"
+DRAFTED_FALLBACK_COLOR = "var(--neutral-200)"
 
 # Global decoder cache
 _decoder_cache = {}
@@ -103,7 +109,7 @@ def tokens_to_html(tokens: list[TokenInfo], head_layers: list[int]) -> str:
 
         html_parts.append(
             f'<span style="background-color: {color}; padding: 2px 4px; '
-            f'border-radius: 3px; margin: 1px; display: inline-block;" title="{title}">{text}</span>'
+            f'border-radius: 3px; margin: 1px; display: inline-block; color: #111827;" title="{title}">{text}</span>'
         )
 
     # Wrap in container with word-wrap to prevent overflow
@@ -121,8 +127,8 @@ def drafted_tokens_to_html(tokens: list[TokenInfo], head_layers: list[int]) -> s
             layer = head_layers[token.exit_head]
             title = f"PENDING - Head {token.exit_head} (Layer {layer})"
         else:
-            color = FULL_MODEL_COLOR
-            title = "PENDING - Full Model"
+            color = DRAFTED_FALLBACK_COLOR
+            title = "PENDING - Unassigned"
 
         text = (
             token.token_text.replace("&", "&amp;")
@@ -134,7 +140,8 @@ def drafted_tokens_to_html(tokens: list[TokenInfo], head_layers: list[int]) -> s
         html_parts.append(
             f'<span style="background-color: {color}; padding: 2px 4px; '
             f"border-radius: 3px; margin: 1px; display: inline-block; "
-            f'border: 2px dashed #333; opacity: 0.7;" title="{title}">{text}</span>'
+            f"border: 2px dashed {PENDING_TOKEN_BORDER}; color: {PENDING_TOKEN_TEXT}; "
+            f'opacity: 0.75;" title="{title}">{text}</span>'
         )
 
     return "".join(html_parts)
@@ -156,17 +163,78 @@ def create_legend(head_layers: list[int]) -> str:
     return " ".join(legend_items)
 
 
-def create_stats_html(result, label: str) -> str:
-    """Create statistics HTML display."""
-    return f"""
-    <div style="padding: 10px; background: #f5f5f5; border-radius: 8px; margin-top: 10px;">
-        <h4 style="margin: 0 0 10px 0;">{label} Statistics</h4>
-        <p><b>Time:</b> {result.total_time:.2f}s</p>
-        <p><b>Tokens/sec:</b> {result.tokens_per_second:.2f}</p>
-        <p><b>Avg Exit Layer:</b> {result.avg_exit_layer:.1f}</p>
-        <p><b>Exit Distribution:</b> {result.exit_distribution}</p>
-    </div>
-    """
+
+@dataclass
+class StatsPayload:
+    generated_at: float
+    speedup_text: str
+    ee_time: str | None
+    ee_tps: str | None
+    ee_avg: str | None
+    full_time: str | None
+    full_tps: str | None
+    full_avg: str | None
+    show_ee: bool
+    show_full: bool
+
+
+def build_stats_outputs(
+    result_ee,
+    result_full,
+    use_early_exit: bool,
+    compare_mode: bool,
+    generated_at: float | None = None,
+):
+    speedup_text = ""
+    if result_ee and result_full and result_full.tokens_per_second > 0:
+        speedup = result_ee.tokens_per_second / result_full.tokens_per_second
+        speedup_text = f"**Speedup:** {speedup:.2f}x"
+    elif result_ee:
+        speedup_text = "**Speedup:** N/A (full model not run)"
+    elif result_full:
+        speedup_text = "**Speedup:** N/A (early exit disabled)"
+
+    if not speedup_text:
+        speedup_text = "**Speedup:** N/A"
+
+    ee_time = f"{result_ee.total_time:.2f}" if result_ee else None
+    ee_tps = f"{result_ee.tokens_per_second:.2f}" if result_ee else None
+    ee_avg = f"{result_ee.avg_exit_layer:.1f}" if result_ee else None
+
+    full_time = f"{result_full.total_time:.2f}" if result_full else None
+    full_tps = f"{result_full.tokens_per_second:.2f}" if result_full else None
+    full_avg = f"{result_full.avg_exit_layer:.1f}" if result_full else None
+
+    show_ee = compare_mode or use_early_exit
+    show_full = compare_mode or not use_early_exit
+
+    return StatsPayload(
+        generated_at=generated_at if generated_at is not None else time.time(),
+        speedup_text=speedup_text,
+        ee_time=ee_time,
+        ee_tps=ee_tps,
+        ee_avg=ee_avg,
+        full_time=full_time,
+        full_tps=full_tps,
+        full_avg=full_avg,
+        show_ee=show_ee,
+        show_full=show_full,
+    )
+
+
+def stats_payload_to_outputs(payload: StatsPayload):
+    return (
+        payload.speedup_text,
+        payload.ee_time,
+        payload.ee_tps,
+        payload.ee_avg,
+        payload.full_time,
+        payload.full_tps,
+        payload.full_avg,
+        gr.update(visible=payload.show_ee),
+        gr.update(visible=payload.show_full),
+    )
+
 
 
 def generate(
@@ -178,12 +246,28 @@ def generate(
     compare_mode: bool,
 ):
     """Main generation function for Gradio interface with streaming."""
+    initial_stats_timestamp = time.time()
     try:
         decoder = get_decoder(model_key)
     except Exception as e:
         error_msg = f"<p style='color: red;'>Error loading model: {e}</p>"
-        yield (error_msg, "", "", error_msg)
+        status_msg = f"**Error loading model:** {e}"
+        stats_payload = build_stats_outputs(
+            None,
+            None,
+            use_early_exit,
+            compare_mode,
+            generated_at=initial_stats_timestamp,
+        )
+        yield (
+            error_msg,
+            "",
+            status_msg,
+            *stats_payload_to_outputs(stats_payload),
+            "",
+        )
         return
+
 
     head_layers = decoder.model_config.head_layer_indices
     legend = create_legend(head_layers)
@@ -199,12 +283,21 @@ def generate(
         # Compare mode with streaming for early exit
         # First, stream the early exit generation
         final_ee_tokens = []
+        ee_streaming_result = None
+
         for event in decoder.generate_streaming(
             prompt=prompt,
             max_tokens=int(max_tokens),
             accuracy_level=closest_level,
             use_chat_template=True,
         ):
+            # Handle "complete" event - extract result and break
+            if event.event_type == "complete":
+                ee_streaming_result = event.result
+                final_ee_tokens = event.tokens
+                break
+
+            final_ee_tokens = event.tokens
             validated_html = ""
             if event.tokens:
                 validated_html = tokens_to_html(event.tokens, head_layers)
@@ -219,91 +312,97 @@ def generate(
 
             combined_html = f"""<div style="word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; line-height: 1.8;">{validated_html}{drafted_html}</div>"""
 
-            status = f"""
-            <div style="padding: 10px; background: #fff3cd; border-radius: 8px;">
-                <b>Early Exit:</b> {event.message} | <b>Full Model:</b> Waiting...
-            </div>
-            """
+            status = (
+                "**Early Exit:** {message}  \n"
+                "**Full Model:** Waiting..."
+            ).format(
+                message=event.message,
+            )
 
+            stats_payload = build_stats_outputs(
+                None,
+                None,
+                use_early_exit,
+                compare_mode,
+                generated_at=initial_stats_timestamp,
+            )
             yield (
                 combined_html,
-                "<p style='color: #666;'>Waiting for early exit to complete...</p>",
+                "<p style='color: var(--body-text-color-subdued);'>Waiting for early exit to complete...</p>",
                 status,
+                *stats_payload_to_outputs(stats_payload),
                 legend,
             )
-            final_ee_tokens = event.tokens
 
         # Now stream full model
         final_full_tokens = []
+        full_streaming_result = None
+
         for event in decoder.generate_full_model_streaming(
             prompt=prompt,
             max_tokens=int(max_tokens),
             use_chat_template=True,
         ):
+            # Handle "complete" event - extract result and break
+            if event.event_type == "complete":
+                full_streaming_result = event.result
+                final_full_tokens = event.tokens
+                break
+
+            final_full_tokens = event.tokens
             html_full = tokens_to_html(event.tokens, head_layers)
-            status = f"""
-            <div style="padding: 10px; background: #fff3cd; border-radius: 8px;">
-                <b>Full Model:</b> {event.message}
-            </div>
-            """
+            status = (
+                "**Full Model:** {message}"
+            ).format(
+                message=event.message,
+            )
+            stats_payload = build_stats_outputs(
+                None,
+                None,
+                use_early_exit,
+                compare_mode,
+                generated_at=initial_stats_timestamp,
+            )
             yield (
                 tokens_to_html(final_ee_tokens, head_layers),
                 html_full,
                 status,
+                *stats_payload_to_outputs(stats_payload),
                 legend,
             )
-            final_full_tokens = event.tokens
 
-        # Final stats
-        result_ee = decoder.generate(
-            prompt=prompt,
-            max_tokens=int(max_tokens),
-            use_early_exit=True,
-            accuracy_level=closest_level,
-            use_chat_template=True,
-        )
-        result_full = decoder.generate(
-            prompt=prompt,
-            max_tokens=int(max_tokens),
-            use_early_exit=False,
-            use_chat_template=True,
-        )
+        # Final output with metrics from streaming results (no re-run needed)
+        html_ee = tokens_to_html(final_ee_tokens, head_layers)
+        html_full = tokens_to_html(final_full_tokens, head_layers)
 
-        html_ee = tokens_to_html(result_ee.tokens, head_layers)
-        html_full = tokens_to_html(result_full.tokens, head_layers)
-
-        speedup = (
-            result_ee.tokens_per_second / result_full.tokens_per_second
-            if result_full.tokens_per_second > 0
-            else 0
+        stats_payload = build_stats_outputs(ee_streaming_result, full_streaming_result, use_early_exit, compare_mode)
+        yield (
+            html_ee,
+            html_full,
+            "",
+            *stats_payload_to_outputs(stats_payload),
+            legend,
         )
-        stats = f"""
-        <div style="padding: 15px; background: #e8f5e9; border-radius: 8px;">
-            <h3 style="margin: 0 0 10px 0;">🚀 Speedup: {speedup:.2f}x</h3>
-            <div style="display: flex; gap: 20px;">
-                <div style="flex: 1; padding: 10px; background: white; border-radius: 8px;">
-                    <h4>Early Exit</h4>
-                    <p><b>Time:</b> {result_ee.total_time:.2f}s | <b>Tokens/sec:</b> {result_ee.tokens_per_second:.2f}</p>
-                    <p><b>Avg Exit Layer:</b> {result_ee.avg_exit_layer:.1f}</p>
-                </div>
-                <div style="flex: 1; padding: 10px; background: white; border-radius: 8px;">
-                    <h4>Full Model</h4>
-                    <p><b>Time:</b> {result_full.total_time:.2f}s | <b>Tokens/sec:</b> {result_full.tokens_per_second:.2f}</p>
-                    <p><b>Avg Exit Layer:</b> {result_full.avg_exit_layer:.1f}</p>
-                </div>
-            </div>
-        </div>
-        """
-        yield (html_ee, html_full, stats, legend)
 
     elif use_early_exit:
         # STREAMING mode for early exit - show draft/verify process
+        streaming_result = None
+        final_tokens = []
+
         for event in decoder.generate_streaming(
             prompt=prompt,
             max_tokens=int(max_tokens),
             accuracy_level=closest_level,
             use_chat_template=True,
         ):
+            # Handle "complete" event - extract result and break
+            if event.event_type == "complete":
+                streaming_result = event.result
+                final_tokens = event.tokens
+                break
+
+            final_tokens = event.tokens
+
             # Build HTML showing validated + drafted tokens
             validated_html = ""
             if event.tokens:
@@ -322,63 +421,86 @@ def generate(
             combined_html = f"""<div style="word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; line-height: 1.8;">{validated_html}{drafted_html}</div>"""
 
             # Status message
-            status = f"""
-            <div style="padding: 10px; background: #fff3cd; border-radius: 8px; margin-top: 5px;">
-                <b>Status:</b> {event.message}
-            </div>
-            """
+            status = (
+                "**Status:** {message}"
+            ).format(
+                message=event.message,
+            )
 
-            yield (combined_html, "", status, legend)
+            stats_payload = build_stats_outputs(
+                None,
+                None,
+                use_early_exit,
+                compare_mode,
+                generated_at=initial_stats_timestamp,
+            )
+            yield (
+                combined_html,
+                "",
+                status,
+                *stats_payload_to_outputs(stats_payload),
+                legend,
+            )
 
-        # Final stats after streaming completes
-        # Re-run to get final stats (or we could track during streaming)
-        result = decoder.generate(
-            prompt=prompt,
-            max_tokens=int(max_tokens),
-            use_early_exit=True,
-            accuracy_level=closest_level,
-            use_chat_template=True,
+        # Final output with metrics from streaming result (no re-run needed)
+        html = tokens_to_html(final_tokens, head_layers)
+        stats_payload = build_stats_outputs(streaming_result, None, use_early_exit, compare_mode)
+        yield (
+            html,
+            "",
+            "",
+            *stats_payload_to_outputs(stats_payload),
+            legend,
         )
-        html = tokens_to_html(result.tokens, head_layers)
-        stats = f"""
-        <div style="padding: 15px; background: #f5f5f5; border-radius: 8px;">
-            <h4 style="margin: 0 0 10px 0;">Early Exit Statistics (Final)</h4>
-            <p><b>Tokens:</b> {len(result.tokens)} | <b>Tokens/sec:</b> {result.tokens_per_second:.2f} | <b>Avg Exit Layer:</b> {result.avg_exit_layer:.1f}</p>
-            <p><b>Exit Distribution:</b> {result.exit_distribution}</p>
-        </div>
-        """
-        yield (html, "", stats, legend)
 
     else:
         # Full model mode (streaming)
+        streaming_result = None
+        final_tokens = []
+
         for event in decoder.generate_full_model_streaming(
             prompt=prompt,
             max_tokens=int(max_tokens),
             use_chat_template=True,
         ):
-            html = tokens_to_html(event.tokens, head_layers)
-            status = f"""
-            <div style="padding: 10px; background: #fff3cd; border-radius: 8px;">
-                <b>Full Model:</b> {event.message}
-            </div>
-            """
-            yield (html, "", status, legend)
+            # Handle "complete" event - extract result and break
+            if event.event_type == "complete":
+                streaming_result = event.result
+                final_tokens = event.tokens
+                break
 
-        # Final stats
-        result = decoder.generate(
-            prompt=prompt,
-            max_tokens=int(max_tokens),
-            use_early_exit=False,
-            use_chat_template=True,
+            final_tokens = event.tokens
+            html = tokens_to_html(event.tokens, head_layers)
+            status = (
+                "**Full Model:** {message}"
+            ).format(
+                message=event.message,
+            )
+            stats_payload = build_stats_outputs(
+                None,
+                None,
+                use_early_exit,
+                compare_mode,
+                generated_at=initial_stats_timestamp,
+            )
+            yield (
+                html,
+                "",
+                status,
+                *stats_payload_to_outputs(stats_payload),
+                legend,
+            )
+
+        # Final output with metrics from streaming result (no re-run needed)
+        html = tokens_to_html(final_tokens, head_layers)
+        stats_payload = build_stats_outputs(None, streaming_result, use_early_exit, compare_mode)
+        yield (
+            html,
+            "",
+            "",
+            *stats_payload_to_outputs(stats_payload),
+            legend,
         )
-        html = tokens_to_html(result.tokens, head_layers)
-        stats = f"""
-        <div style="padding: 15px; background: #f5f5f5; border-radius: 8px;">
-            <h4 style="margin: 0 0 10px 0;">Full Model Statistics</h4>
-            <p><b>Tokens:</b> {len(result.tokens)} | <b>Time:</b> {result.total_time:.2f}s | <b>Tokens/sec:</b> {result.tokens_per_second:.2f}</p>
-        </div>
-        """
-        yield (html, "", stats, legend)
 
 
 def build_demo():
@@ -444,8 +566,22 @@ def build_demo():
                 gr.Markdown("### Full Model (Comparison)")
                 output_full = gr.HTML()
 
-        # Stats (full width)
-        stats_html = gr.HTML()
+        status_html = gr.Markdown()
+
+        with gr.Group():
+            gr.Markdown("### Speedup Recap")
+            speedup_md = gr.Markdown()
+            with gr.Row():
+                with gr.Column(visible=True) as ee_stats_col:
+                    gr.Markdown("#### Early Exit")
+                    ee_time = gr.Label(label="Time (s)")
+                    ee_tps = gr.Label(label="Tokens/sec")
+                    ee_avg = gr.Label(label="Avg Exit Layer")
+                with gr.Column(visible=False) as full_stats_col:
+                    gr.Markdown("#### Full Model")
+                    full_time = gr.Label(label="Time (s)")
+                    full_tps = gr.Label(label="Tokens/sec")
+                    full_avg = gr.Label(label="Avg Exit Layer")
 
         def update_visibility(compare):
             return gr.update(visible=compare)
@@ -466,7 +602,21 @@ def build_demo():
                 max_tokens,
                 compare_mode,
             ],
-            outputs=[output_ee, output_full, stats_html, legend_html],
+            outputs=[
+                output_ee,
+                output_full,
+                status_html,
+                speedup_md,
+                ee_time,
+                ee_tps,
+                ee_avg,
+                full_time,
+                full_tps,
+                full_avg,
+                ee_stats_col,
+                full_stats_col,
+                legend_html,
+            ],
         )
 
     return demo
@@ -474,4 +624,4 @@ def build_demo():
 
 if __name__ == "__main__":
     demo = build_demo()
-    demo.launch(share=False)
+    demo.launch(share=False, debug=True)
