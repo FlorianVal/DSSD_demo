@@ -717,7 +717,7 @@ class DSSDecoder:
                     hidden_states=hidden_states,
                     position_ids=position_ids,
                     attention_mask=None,
-                    past_key_value=None,
+                    past_key_values=None,
                     position_embeddings=position_embeddings,
                     use_cache=False,
                     cache_position=cache_position,
